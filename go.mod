@@ -6,6 +6,7 @@ require (
 	cloud.google.com/go v0.63.0 // indirect
 	github.com/NanakoL/mtproto v0.0.0-20200801054228-da5159a88548
 	github.com/ansel1/merry v1.5.1
+	github.com/antonfisher/nested-logrus-formatter v1.1.0
 	github.com/go-sql-driver/mysql v1.5.0
 	github.com/sirupsen/logrus v1.6.0
 	golang.org/x/crypto v0.0.0-20200728195943-123391ffb6de // indirect

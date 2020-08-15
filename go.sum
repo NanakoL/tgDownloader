@@ -39,6 +39,8 @@ github.com/NanakoL/mtproto v0.0.0-20200801054228-da5159a88548 h1:hhbYw7elmwLqzHI
 github.com/NanakoL/mtproto v0.0.0-20200801054228-da5159a88548/go.mod h1:1JGWyBE7cXrxefE9HMx5ovxWe3+bB2eQeJfCxH5tWJU=
 github.com/ansel1/merry v1.5.1 h1:/MlZd3Irx2HQsUlOcXTTYev7N1t1Rsdnxwg6xkOVJp4=
 github.com/ansel1/merry v1.5.1/go.mod h1:wUy/yW0JX0ix9GYvUbciq+bi3jW/vlKPlbpI7qdZpOw=
+github.com/antonfisher/nested-logrus-formatter v1.1.0 h1:wb5SkAtQD/VMTOkYimj8PtdNvbNEs0QWOQXSZAw/Ars=
+github.com/antonfisher/nested-logrus-formatter v1.1.0/go.mod h1:6WTfyWFkBc9+zyBaKIqRrg/KwMqBbodBjgbHjDz7zjA=
 github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=
 github.com/chzyer/logex v1.1.10/go.mod h1:+Ywpsq7O8HXn0nuIou7OrIPyXbp3wmkHB+jjWRnGsAI=
 github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e/go.mod h1:nSuG5e5PlCu98SY8svDHJxuZscDgtXS6KTTbou5AhLI=

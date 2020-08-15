@@ -1,9 +1,9 @@
 package extractors
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -24,6 +24,8 @@ var (
 
 type Bili struct {
 	API
+	currentP  int
+	context   context.Context
 	cookie    string
 	Title     string
 	Meta      string
@@ -111,11 +113,14 @@ func (l *Bili) SetCookie(s string) {
 	l.cookie = s
 }
 
-func (l *Bili) Download(band string, tn chan int) (string, error) {
+func (l *Bili) Download(ctx context.Context, band string, tn chan int) (string, error) {
 	defer close(tn)
 	found := false
 	var videoURL string
 	var audioURL string
+
+	var audioFile string
+	var videoFile string
 
 	if len(l.DownInfo.Data.DashData.Video) != 0 {
 		for _, o := range l.DownInfo.Data.DashData.Video {
@@ -128,26 +133,36 @@ func (l *Bili) Download(band string, tn chan int) (string, error) {
 		if !found {
 			return "", fmt.Errorf("bandwidth unknown")
 		}
+		audioFile = path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".m4v")
+		videoFile = path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".m4v")
 	} else {
-		for c, v := range l.DownInfo.Data.RateInt {
-			if v == l.DownInfo.Data.Quality {
+		if strconv.Itoa(l.DownInfo.Data.Quality) != band {
+			if _, err := strconv.Atoi(band); err == nil {
+				err := l.requestDownInfo(l.currentP, 120)
+				if err != nil {
+					return "", err
+				}
 				found = true
-				videoURL = l.DownInfo.Data.DurlData[c].URL
-				break
+				videoURL = l.DownInfo.Data.DurlData[0].URL
+			} else {
+				return "", fmt.Errorf("unknown band")
 			}
+		} else {
+			found = true
+			videoURL = l.DownInfo.Data.DurlData[0].URL
 		}
+		//audioFile = path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".m4v")
+		videoFile = path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".flv")
 	}
-
-	log.Println(audioURL, videoURL, tn)
-	audioFile := path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".m4v")
-	videoFile := path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".m4v")
 
 	ck := baseHeader
 	if l.cookie != "" {
 		ck["cookie"] = l.cookie
 	}
 	ck["referer"] = "https://www.bilibili.com/"
-	err := dlHandler(videoFile, videoURL, ck, tn)
+
+	log.Println(audioURL, videoURL, tn, ck)
+	err := dlHandler(ctx, videoFile, videoURL, ck, tn)
 	if err != nil {
 		log.Println(err)
 		_ = os.Remove(videoFile)
@@ -155,7 +170,7 @@ func (l *Bili) Download(band string, tn chan int) (string, error) {
 	}
 
 	if audioURL != "" {
-		err := dlHandler(audioFile, audioURL, ck, tn)
+		err := dlHandler(ctx, audioFile, audioURL, ck, tn)
 		if err != nil {
 			_ = os.Remove(audioFile)
 			return "", err
@@ -247,14 +262,23 @@ func (l *Bili) GetDownInfo(p int) ([]string, []int, error) {
 	if p > len(l.VideoInfo.Pages) {
 		return nil, nil, fmt.Errorf("invalid count")
 	}
+	l.currentP = p
+	err := l.requestDownInfo(p, 120)
+	if err != nil {
+		return nil, nil, err
+	}
+	return l.GenDownMsg()
+}
 
-	link := fmt.Sprintf("https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%d&qn=120&fourk=1&fnval=16",
-		l.VideoInfo.BvID, l.VideoInfo.Pages[p].Cid)
+func (l *Bili) requestDownInfo(p int, band int) error {
+	link := fmt.Sprintf("https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%d&qn=%d&fourk=1&fnval=16",
+		l.VideoInfo.BvID, l.VideoInfo.Pages[p].Cid, band)
 
 	ck := baseHeader
 	if l.cookie != "" {
 		ck["cookie"] = l.cookie
 	}
+	ck["referer"] = "https://www.bilibili.com/"
 	//rsl, err := json.Marshal(ck)
 	//if err != nil {
 	//	return nil, nil, err
@@ -274,12 +298,12 @@ func (l *Bili) GetDownInfo(p int) ([]string, []int, error) {
 		}
 		if err != nil {
 			log.Println(err)
-			return nil, nil, fmt.Errorf("request failed, downinfo query")
+			return fmt.Errorf("request failed, downinfo query")
 		}
 
 		var parsedResp2 b2PlayInfo
 		if err := json.Unmarshal([]byte(body), &parsedResp2); err != nil {
-			return nil, nil, err
+			return err
 		}
 
 		if parsedResp2.Code == -404 && r != hkRelay {
@@ -290,11 +314,10 @@ func (l *Bili) GetDownInfo(p int) ([]string, []int, error) {
 			l.DownInfo = parsedResp2
 			break
 		} else {
-			return nil, nil, fmt.Errorf("invalid response: %s", parsedResp2.Message)
+			return fmt.Errorf("invalid response: %s", parsedResp2.Message)
 		}
 	}
-
-	return l.GenDownMsg()
+	return nil
 }
 
 func (l *Bili) GetDuring() int32 {
@@ -375,15 +398,14 @@ func (l *Bili) GenDownMsg() ([]string, []int, error) {
 		if len(s2.Data.DurlData) == 0 {
 			return nil, nil, fmt.Errorf("视频信息错误")
 		}
-		label := "unknown"
 		for c, v := range s2.Data.RateInt {
-			if v == s2.Data.Quality {
+			label := "unknown"
+			if v <= s2.Data.Quality {
 				label = s2.Data.RateText[c]
-				break
+				videoRate = append(videoRate, fmt.Sprintf("%s - %d", label, s2.Data.Quality))
+				rateInt = append(rateInt, s2.Data.Quality)
 			}
 		}
-		videoRate = append(videoRate, fmt.Sprintf("%s - %d", label, s2.Data.Quality))
-		rateInt = append(rateInt, s2.Data.Quality)
 	} else {
 		for _, v := range s2.Data.DashData.Video {
 			label := "unknown"

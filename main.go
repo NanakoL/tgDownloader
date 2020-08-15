@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/NanakoL/mtproto"
 	"github.com/ansel1/merry"
-	log "github.com/sirupsen/logrus"
+	nested "github.com/antonfisher/nested-logrus-formatter"
+	logLib "github.com/sirupsen/logrus"
+	"golang.org/x/net/context"
 	"io"
 	"main/extractors"
 	"math"
@@ -20,10 +22,23 @@ import (
 	"unsafe"
 )
 
+type client struct {
+	*mtproto.MTProto
+}
+
 var (
-	m          *mtproto.MTProto
+	log = &logLib.Logger{
+		Out:          os.Stderr,
+		Formatter:    new(nested.Formatter),
+		Hooks:        make(logLib.LevelHooks),
+		Level:        logLib.InfoLevel,
+		ExitFunc:     os.Exit,
+		ReportCaller: false,
+	}
+	//m          *mtproto.MTProto
 	activeTask sync.Map
 	userCookie sync.Map
+	taskLimit  int64
 )
 
 const mutexLocked = 1 << iota
@@ -44,15 +59,36 @@ type wrapper struct {
 	initTime  time.Time
 	msgID     int32
 	currentP  int
+	ctx       context.Context
+	cancel    context.CancelFunc
+	dlCancel  context.CancelFunc
+	client    *client
 }
 
 func main() {
-	//go pendingListManager()
+
+	defer deInit()
 	go cleaner()
-	log.SetLevel(log.InfoLevel)
-	if err := start(appID, appHash, token); err != nil {
-		log.Fatal(merry.Details(err))
-	}
+	go start(appID, appHash, token1, "dc1.json")
+	go start(appID, appHash, token4, "dc4.json")
+	go start(appID, appHash, token5, "dc5.json")
+	<-chan bool(nil)
+}
+
+func deInit() {
+	activeTask.Range(func(key, value interface{}) bool {
+		log.Println("Cancelling Task " + key.(string))
+		val := value.(*wrapper)
+		val.cancel()
+		val.client.SendSync(mtproto.MessagesEditMessage{
+			Flags:   1 << 11,
+			Peer:    mtproto.InputPeerUser{UserID: val.userID},
+			ID:      val.downMsgID,
+			Message: "Cancelled: System Reloaded",
+		})
+		return true
+	})
+	time.Sleep(5 * time.Second)
 }
 
 func cleaner() {
@@ -61,7 +97,7 @@ func cleaner() {
 		activeTask.Range(func(key, value interface{}) bool {
 			val := value.(*wrapper)
 			if ok := val.downLock.TryLock(); ok {
-				if time.Now().Unix() - val.initTime.Unix() > 12800 {
+				if time.Now().Unix()-val.initTime.Unix() > 12800 {
 					// cleanup
 					delList = append(delList, key)
 				}
@@ -71,22 +107,26 @@ func cleaner() {
 		})
 		for _, v := range delList {
 			if s, ok := activeTask.Load(v); ok {
+				activeTask.Delete(v)
 				val := s.(*wrapper)
-				if ok := val.downLock.TryLock(); ok {
-					activeTask.Delete(v)
-				}
-				val.downLock.Unlock()
+				val.cancel()
+				val.client.Send(mtproto.MessagesEditMessage{
+					Flags:   1 << 11,
+					Peer:    mtproto.InputPeerUser{UserID: val.userID},
+					ID:      val.downMsgID,
+					Message: "Cancelled: Task Timeout",
+				})
 			}
 		}
 		time.Sleep(time.Hour)
 	}
 }
 
-func start(appID int32, appHash, token string) error {
+func start(appID int32, appHash, token, cert string) {
 
 	config := mtproto.NewAppConfig(appID, appHash)
 
-	session, err := mtproto.LoadSession("cred.json")
+	session, err := mtproto.LoadSession(cert)
 	if err != nil {
 		panic(err)
 	}
@@ -95,13 +135,13 @@ func start(appID int32, appHash, token string) error {
 	//	log.Println("can't connect to the proxy:", err)
 	//	os.Exit(1)
 	//}
-	m = mtproto.NewMTProto(config)
+	m := client{mtproto.NewMTProto(config)}
 	//m.SetDialer(dialer)
 	m.SetSession(session)
 	m.UseIPv6(true)
 
 	if err := m.InitSessAndConnect(); err != nil {
-		return merry.Wrap(err)
+		panic(err)
 	}
 
 	for {
@@ -121,24 +161,23 @@ func start(appID int32, appHash, token string) error {
 	}
 
 	log.Println("Seems authed.")
-	_ = m.CopySession().Save("cred.json")
-	m.SetEventsHandler(updateHandler)
+	_ = m.CopySession().Save(cert)
+	m.SetEventsHandler(m.updateHandler)
 
 	<-chan bool(nil) //pausing forever
-	return nil
 }
 
-func updateHandler(updateTL mtproto.TL) {
+func (m *client) updateHandler(updateTL mtproto.TL) {
 	switch update := updateTL.(type) {
 	case mtproto.UpdateBotCallbackQuery:
 		log.Printf("Callback %+v\n", string(update.Data))
-		go newCallbackHandler(update)
+		go m.newCallbackHandler(update)
 	case mtproto.UpdateNewMessage:
 		log.Printf("Message %+v\n", update.Message)
-		go newMessageHandler(update.Message)
+		go m.newMessageHandler(update.Message)
 	case mtproto.Updates:
 		for _, item := range update.Updates {
-			updateHandler(item)
+			m.updateHandler(item)
 		}
 
 	default:
@@ -146,27 +185,52 @@ func updateHandler(updateTL mtproto.TL) {
 	}
 }
 
-func progUpdater(c chan int, msgID int32, userID int32, cont string, tcl int64) {
-	var total int
+func (m *client) progUpdater(c chan int, msgID int32, userID int32, reqID, cont string, tcl int64) {
+	total := 1
+	//if tcl == 0 {
+	//	tcl = int64(<-c)
+	//}
+	rows := []mtproto.KeyboardButtonRow{
+		{Buttons: []mtproto.TL{
+			mtproto.KeyboardButtonCallback{
+				Text: "取消",
+				Data: []byte(fmt.Sprintf("%s,cancel", reqID)),
+			},
+		}},
+	}
+	m0 := time.Now().Unix() - 1
 	for w := range c {
 		total += w
 		var msg string
+		dx := int64(total) / (time.Now().Unix() - m0)
 		if tcl != 0 {
 			p := extractors.ByteCountIEC(tcl)
-			msg = fmt.Sprintf("%s...(%s/%s)", cont, extractors.ByteCountIEC(int64(total)), p)
+			msg = fmt.Sprintf("%s...(%s/%s) %s/s", cont,
+				extractors.ByteCountIEC(int64(total)), p, extractors.ByteCountIEC(dx))
+			m.Send(mtproto.MessagesEditMessage{
+				Flags:   1 << 11,
+				Peer:    mtproto.InputPeerUser{UserID: userID},
+				ID:      msgID,
+				Message: msg,
+			})
 		} else {
-			msg = fmt.Sprintf("%s...(%s)", cont, extractors.ByteCountIEC(int64(total)))
+			msg = fmt.Sprintf("%s...(%s) %s/s", cont,
+				extractors.ByteCountIEC(int64(total)), extractors.ByteCountIEC(dx))
+			m.Send(mtproto.MessagesEditMessage{
+				Flags:   1<<11 | 1<<2,
+				Peer:    mtproto.InputPeerUser{UserID: userID},
+				ID:      msgID,
+				Message: msg,
+				ReplyMarkup: mtproto.ReplyInlineMarkup{
+					Rows: mtproto.SliceToTLStable(rows),
+				},
+			})
 		}
-		m.Send(mtproto.MessagesEditMessage{
-			Flags:   1 << 11,
-			Peer:    mtproto.InputPeerUser{UserID: userID},
-			ID:      msgID,
-			Message: msg,
-		})
+
 	}
 }
 
-func newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
+func (m *client) newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 	if string(update.Data) == "null" {
 		m.Send(mtproto.MessagesSetBotCallbackAnswer{
 			Flags:   1 << 0,
@@ -193,10 +257,26 @@ func newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 		})
 		return
 	}
+	if taskLimit <= 10 {
+		atomic.AddInt64(&taskLimit, 1)
+		defer atomic.AddInt64(&taskLimit, -1)
+	} else {
+		m.Send(mtproto.MessagesSetBotCallbackAnswer{
+			Flags:   1 << 0,
+			QueryID: update.QueryID,
+			Message: fmt.Sprintf("目前bot负载较大（%d），请稍后再试", taskLimit),
+		})
+	}
 	reqID := parse[0]
 	action := parse[1]
 	if val, ok := activeTask.Load(reqID); ok {
 		res := val.(*wrapper)
+		if action == "cancel" {
+			if res.dlCancel != nil {
+				res.dlCancel()
+			}
+			return
+		}
 		if ok := res.downLock.TryLock(); !ok {
 			m.Send(mtproto.MessagesSetBotCallbackAnswer{
 				Flags:   1 << 0,
@@ -207,16 +287,16 @@ func newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 		}
 		defer res.downLock.Unlock()
 		if action == "download" {
-			queryHandler(res, update.UserID, reqID)
+			m.queryHandler(res, update.UserID, reqID)
 			return
 		}
 		if action == "d2d3" {
 			band := parse[2]
-			downloadHandler(res, update.UserID, band)
+			m.downloadHandler(res, update.UserID, reqID, band)
 			return
 		}
 		if action == "select" {
-			selectHandler(res, update.UserID, update.QueryID, reqID)
+			m.selectHandler(res, update.UserID, update.QueryID, reqID)
 			return
 		}
 		if action == "page" {
@@ -224,7 +304,7 @@ func newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 			if err != nil {
 				return
 			}
-			pageHandler(res, update.UserID, page, reqID)
+			m.pageHandler(res, update.UserID, page, reqID)
 			return
 		}
 		if action == "s4s5" {
@@ -232,7 +312,7 @@ func newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 			if err != nil {
 				return
 			}
-			pHandler(res, update.UserID, sel, reqID)
+			m.pHandler(res, update.UserID, sel, reqID)
 			return
 		}
 		if action == "deletedown" {
@@ -252,7 +332,7 @@ func newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 	}
 }
 
-func pHandler(res *wrapper, userID int32, sel int, reqID string) {
+func (m *client) pHandler(res *wrapper, userID int32, sel int, reqID string) {
 	res.currentP = sel
 	rows := []mtproto.KeyboardButtonRow{
 		{Buttons: []mtproto.TL{
@@ -278,7 +358,7 @@ func pHandler(res *wrapper, userID int32, sel int, reqID string) {
 	})
 }
 
-func pageHandler(res *wrapper, userID int32, page int, reqID string) {
+func (m *client) pageHandler(res *wrapper, userID int32, page int, reqID string) {
 	offset := (page - 1) * 5
 	max := offset + 5
 	if res.GetCount() <= max {
@@ -286,7 +366,7 @@ func pageHandler(res *wrapper, userID int32, page int, reqID string) {
 	}
 	var rows []mtproto.KeyboardButtonRow
 	for i := offset; i < max; i++ {
-		title := res.GetTitle(i)
+		title := res.GetSubTitle(i)
 		rows = append(rows, mtproto.KeyboardButtonRow{
 			Buttons: []mtproto.TL{
 				mtproto.KeyboardButtonCallback{
@@ -329,7 +409,7 @@ func pageHandler(res *wrapper, userID int32, page int, reqID string) {
 	})
 }
 
-func selectHandler(res *wrapper, userID int32, queryID int64, reqID string) {
+func (m *client) selectHandler(res *wrapper, userID int32, queryID int64, reqID string) {
 	if res.GetCount() == 1 {
 		m.Send(mtproto.MessagesSetBotCallbackAnswer{
 			Flags:   1 << 0,
@@ -379,7 +459,7 @@ func selectHandler(res *wrapper, userID int32, queryID int64, reqID string) {
 	})
 }
 
-func queryHandler(res *wrapper, userID int32, reqID string) {
+func (m *client) queryHandler(res *wrapper, userID int32, reqID string) {
 	l := m.SendSync(mtproto.MessagesSendMessage{
 		Peer:     mtproto.InputPeerUser{UserID: userID},
 		RandomID: rand.Int63(),
@@ -427,22 +507,36 @@ func queryHandler(res *wrapper, userID int32, reqID string) {
 	})
 }
 
-func downloadHandler(res *wrapper, userID int32, band string) {
+func (m *client) downloadHandler(res *wrapper, userID int32, reqID, band string) {
+	rows := []mtproto.KeyboardButtonRow{
+		{Buttons: []mtproto.TL{
+			mtproto.KeyboardButtonCallback{
+				Text: "取消",
+				Data: []byte(fmt.Sprintf("%s,cancel", reqID)),
+			},
+		}},
+	}
 	m.SendSync(mtproto.MessagesEditMessage{
-		Flags:   1 << 11,
+		Flags:   1<<11 | 1<<2,
 		Peer:    mtproto.InputPeerUser{UserID: userID},
 		ID:      res.downMsgID,
-		Message: fmt.Sprintf("Preparing..."),
+		Message: fmt.Sprintf(res.GetTitle(res.currentP) + "\n\nPreparing..."),
+		ReplyMarkup: mtproto.ReplyInlineMarkup{
+			Rows: mtproto.SliceToTLStable(rows),
+		},
 	})
 	tuns := make(chan int)
-	go progUpdater(tuns, res.downMsgID, userID, "Downloading", 0)
-	f, err := res.Download(band, tuns)
+	ctx, cancel := context.WithCancel(res.ctx)
+	res.dlCancel = cancel
+	go m.progUpdater(tuns, res.downMsgID, userID, reqID, res.GetTitle(res.currentP)+"\n\nDownloading", 0)
+	f, err := res.Download(ctx, band, tuns)
+	cancel()
 	if err != nil {
 		m.SendSync(mtproto.MessagesEditMessage{
 			Flags:   1 << 11,
 			Peer:    mtproto.InputPeerUser{UserID: userID},
 			ID:      res.downMsgID,
-			Message: fmt.Sprintf("Download Failed"),
+			Message: res.GetTitle(res.currentP) + "\n\nDownload Failed or Cancelled",
 		})
 		_ = os.Remove(f)
 		return
@@ -456,7 +550,7 @@ func downloadHandler(res *wrapper, userID int32, band string) {
 		Flags:   1 << 11,
 		Peer:    mtproto.InputPeerUser{UserID: userID},
 		ID:      res.downMsgID,
-		Message: fmt.Sprintf("Uploading...(%s/%s)", extractors.ByteCountIEC(0), extractors.ByteCountIEC(info.Size())),
+		Message: fmt.Sprintf(res.GetTitle(res.currentP)+"\n\nUploading...(%s/%s)", extractors.ByteCountIEC(0), extractors.ByteCountIEC(info.Size())),
 	})
 	wg := new(sync.WaitGroup)
 	if info.Size() > 1.99*1000*1000*1000 {
@@ -464,13 +558,14 @@ func downloadHandler(res *wrapper, userID int32, band string) {
 			Flags:   1 << 11,
 			Peer:    mtproto.InputPeerUser{UserID: userID},
 			ID:      res.downMsgID,
-			Message: fmt.Sprintf("文件大小过大：无法上传至Telegram，已保存在本地。"),
+			Message: fmt.Sprintf("%s\n\n文件大小过大（%s）：无法上传至Telegram，已保存在本地。", res.GetTitle(res.currentP), extractors.ByteCountIEC(info.Size())),
 		})
 	} else {
 		wg.Add(1)
-		go uploadHandler(res, userID, info, band, f, wg)
+		go m.uploadHandler(res, userID, info, band, f, wg)
 	}
-	go wgHandler(wg, f)
+	wg.Add(1)
+	wgHandler(wg, f)
 }
 
 func wgHandler(wg *sync.WaitGroup, f string) {
@@ -478,15 +573,15 @@ func wgHandler(wg *sync.WaitGroup, f string) {
 	_ = os.Remove(f)
 }
 
-func uploadHandler(res *wrapper, userID int32, info os.FileInfo, band, f string, wg *sync.WaitGroup) {
+func (m *client) uploadHandler(res *wrapper, userID int32, info os.FileInfo, band, f string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	file, err := os.Open(f)
 	if err != nil {
 		return
 	}
 	tuns := make(chan int)
-	go progUpdater(tuns, res.downMsgID, userID, "Uploading", info.Size())
-	fl := uploadBigFile(file, info.Size(), tuns)
+	go m.progUpdater(tuns, res.downMsgID, userID, "0", res.GetTitle(res.currentP)+"\n\nUploading", info.Size())
+	fl := m.uploadBigFile(file, info.Size(), tuns)
 	fl.Name = info.Name()
 	_ = file.Close()
 
@@ -494,7 +589,7 @@ func uploadHandler(res *wrapper, userID int32, info os.FileInfo, band, f string,
 	frame, err := getFrame(f)
 	if err == nil {
 		// parse
-		src := uploadSmallFile(frame, int64(frame.Len()))
+		src := m.uploadSmallFile(frame, int64(frame.Len()))
 		src.Name = strconv.Itoa(rand.Int())
 		image = &src
 	} else {
@@ -536,7 +631,7 @@ func uploadHandler(res *wrapper, userID int32, info os.FileInfo, band, f string,
 	log.Println(resp)
 }
 
-func newMessageHandler(message mtproto.TL) {
+func (m *client) newMessageHandler(message mtproto.TL) {
 	var msg mtproto.Message
 	if _, ok := message.(mtproto.Message); ok {
 		msg = message.(mtproto.Message)
@@ -548,9 +643,24 @@ func newMessageHandler(message mtproto.TL) {
 			m.Send(mtproto.MessagesSendMessage{
 				Peer:     mtproto.InputPeerUser{UserID: msg.FromID},
 				RandomID: rand.Int63(),
-				Message:  "本bot什么都不会，Sako也是。\n\nGithub: https://github.com/NanakoL/tgDownloader",
+				Message:  "本bot什么都不会，Sako也是。\n\n使用说明见 /help",
 			})
 			return
+		}
+
+		if msg.Message == "/help" {
+			b := "将链接发送到本bot即可开始使用，支持AcFun / BiliBili / Youtube，可以通过 /cookie 设置个人Cookie。 \n\n" +
+				"位于其他数据中心的bot:\n" +
+				"@s6upbot - Data Center 1, United States\n" +
+				"@s6downbot - Data Center 4, Netherlands\n" +
+				"@s6ccbot - Data Center 5, Singapore" +
+				"\n\nGithub: https://github.com/NanakoL/tgDownloader"
+			rand.Seed(time.Now().UnixNano())
+			m.Send(mtproto.MessagesSendMessage{
+				Peer:     mtproto.InputPeerUser{UserID: msg.FromID},
+				RandomID: rand.Int63(),
+				Message:  b,
+			})
 		}
 
 		if msg.Message == "/cookie" {
@@ -614,6 +724,17 @@ func newMessageHandler(message mtproto.TL) {
 			if msgID == 0 {
 				return
 			}
+			if taskLimit <= 10 {
+				atomic.AddInt64(&taskLimit, 1)
+				defer atomic.AddInt64(&taskLimit, -1)
+			} else {
+				m.Send(mtproto.MessagesEditMessage{
+					Flags:   1 << 11,
+					Peer:    mtproto.InputPeerUser{UserID: msg.FromID},
+					ID:      msgID,
+					Message: fmt.Sprintf("目前bot负载较大（%d），请稍后再试", taskLimit),
+				})
+			}
 			if ck, ok := userCookie.Load(msg.FromID); ok {
 				api.SetCookie(ck.(string))
 			}
@@ -628,11 +749,15 @@ func newMessageHandler(message mtproto.TL) {
 				})
 			} else {
 				reqID := strconv.Itoa(rand.Int())
+				ctx, cancel := context.WithCancel(context.Background())
 				activeTask.Store(reqID, &wrapper{
 					API:      api,
 					initTime: time.Now(),
 					msgID:    msgID,
 					currentP: 0,
+					ctx:      ctx,
+					cancel:   cancel,
+					client:   m,
 				})
 
 				rows := []mtproto.KeyboardButtonRow{
@@ -677,7 +802,7 @@ func getMsgID(m mtproto.TL) int32 {
 }
 
 //func uploadBigFile(w chan int, file *os.File, info os.FileInfo) mtproto.InputFileBig {
-func uploadBigFile(file io.Reader, size int64, p ...chan int) mtproto.InputFileBig {
+func (m *client) uploadBigFile(file io.Reader, size int64, p ...chan int) mtproto.InputFileBig {
 	pipe := false
 	if len(p) > 0 {
 		pipe = true
@@ -730,7 +855,7 @@ func uploadBigFile(file io.Reader, size int64, p ...chan int) mtproto.InputFileB
 	return res
 }
 
-func uploadSmallFile(file io.Reader, size int64, p ...chan int) mtproto.InputFile {
+func (m *client) uploadSmallFile(file io.Reader, size int64, p ...chan int) mtproto.InputFile {
 	pipe := false
 	if len(p) > 0 {
 		pipe = true

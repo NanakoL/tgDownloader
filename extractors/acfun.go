@@ -1,10 +1,10 @@
 package extractors
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -82,7 +82,7 @@ func (l *AcFun) SetCookie(s string) {
 	l.cookie = s
 }
 
-func (l *AcFun) Download(band string, tn chan int) (string, error) {
+func (l *AcFun) Download(ctx context.Context, band string, tn chan int) (string, error) {
 
 	defer close(tn)
 	var dest string
@@ -106,21 +106,26 @@ func (l *AcFun) Download(band string, tn chan int) (string, error) {
 
 	for _, v := range src.Segments {
 		var content []byte
-		for {
-			r := ResolveURL(src.URL, v.URI)
-			log.Println(r)
-			body, err := HttpGet(r)
-			if err == nil && body != nil {
-				content, err = ioutil.ReadAll(body)
-				_ = body.Close()
-				if err == nil {
-					break
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("ctx cancelled")
+		default:
+			for {
+				r := ResolveURL(src.URL, v.URI)
+				log.Println(r)
+				body, err := HttpGet(ctx, r)
+				if err == nil && body != nil {
+					content, err = ioutil.ReadAll(body)
+					_ = body.Close()
+					if err == nil {
+						break
+					}
 				}
+				time.Sleep(time.Second)
 			}
-			time.Sleep(time.Second)
+			n, _ := file.Write(content)
+			tn <- n
 		}
-		n, _ := file.Write(content)
-		tn <- n
 	}
 	_ = file.Close()
 	fin := path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".mp4")
