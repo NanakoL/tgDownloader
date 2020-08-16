@@ -4,20 +4,24 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/NanakoL/mtproto"
-	"github.com/ansel1/merry"
 	nested "github.com/antonfisher/nested-logrus-formatter"
 	logLib "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
+	"image"
+	"image/jpeg"
 	"io"
+	"io/ioutil"
 	"main/extractors"
 	"math"
 	"math/rand"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 )
@@ -35,13 +39,15 @@ var (
 		ExitFunc:     os.Exit,
 		ReportCaller: false,
 	}
-	//m          *mtproto.MTProto
 	activeTask sync.Map
 	userCookie sync.Map
 	taskLimit  int64
+	userLimit  sync.Map
 )
 
-const mutexLocked = 1 << iota
+const (
+	mutexLocked = 1 << iota
+)
 
 type Mutex struct {
 	sync.Mutex
@@ -49,6 +55,10 @@ type Mutex struct {
 
 func (m *Mutex) TryLock() bool {
 	return atomic.CompareAndSwapInt32((*int32)(unsafe.Pointer(&m.Mutex)), 0, mutexLocked)
+}
+
+func (m *Mutex) TryUnlock() bool {
+	return atomic.CompareAndSwapInt32((*int32)(unsafe.Pointer(&m.Mutex)), mutexLocked, 0)
 }
 
 type wrapper struct {
@@ -66,16 +76,16 @@ type wrapper struct {
 }
 
 func main() {
-
-	defer deInit()
+	// init
+	_ = os.RemoveAll(os.TempDir())
+	_ = os.Mkdir(os.TempDir(), 0666)
 	go cleaner()
 	go start(appID, appHash, token1, "dc1.json")
 	go start(appID, appHash, token4, "dc4.json")
 	go start(appID, appHash, token5, "dc5.json")
-	<-chan bool(nil)
-}
-
-func deInit() {
+	s := make(chan os.Signal, 1)
+	signal.Notify(s, syscall.SIGTERM, syscall.SIGINT, syscall.SIGKILL, syscall.SIGSTOP)
+	sig := <-s
 	activeTask.Range(func(key, value interface{}) bool {
 		log.Println("Cancelling Task " + key.(string))
 		val := value.(*wrapper)
@@ -84,11 +94,10 @@ func deInit() {
 			Flags:   1 << 11,
 			Peer:    mtproto.InputPeerUser{UserID: val.userID},
 			ID:      val.downMsgID,
-			Message: "Cancelled: System Reloaded",
+			Message: fmt.Sprintf("Cancelled: system reload(ref: signal.%d)", sig),
 		})
 		return true
 	})
-	time.Sleep(5 * time.Second)
 }
 
 func cleaner() {
@@ -96,13 +105,10 @@ func cleaner() {
 		var delList []interface{}
 		activeTask.Range(func(key, value interface{}) bool {
 			val := value.(*wrapper)
-			if ok := val.downLock.TryLock(); ok {
-				if time.Now().Unix()-val.initTime.Unix() > 12800 {
-					// cleanup
-					delList = append(delList, key)
-				}
+			if time.Now().Unix()-val.initTime.Unix() > 21600 {
+				// cleanup
+				delList = append(delList, key)
 			}
-			val.downLock.Unlock()
 			return true
 		})
 		for _, v := range delList {
@@ -148,7 +154,7 @@ func start(appID int32, appHash, token, cert string) {
 		res := m.SendSync(mtproto.UpdatesGetState{})
 		if mtproto.IsErrorType(res, mtproto.ErrUnauthorized) {
 			if err := m.AuthBot(token); err != nil {
-				log.Error(merry.Wrap(err))
+				log.Error(err)
 			}
 			continue
 		}
@@ -185,7 +191,7 @@ func (m *client) updateHandler(updateTL mtproto.TL) {
 	}
 }
 
-func (m *client) progUpdater(c chan int, msgID int32, userID int32, reqID, cont string, tcl int64) {
+func (m *client) progressUpdater(c chan int, msgID int32, userID int32, reqID, cont string, tcl int64) {
 	total := 1
 	//if tcl == 0 {
 	//	tcl = int64(<-c)
@@ -205,6 +211,7 @@ func (m *client) progUpdater(c chan int, msgID int32, userID int32, reqID, cont 
 		dx := int64(total) / (time.Now().Unix() - m0)
 		if tcl != 0 {
 			p := extractors.ByteCountIEC(tcl)
+			log.Println(extractors.ByteCountIEC(int64(total)), p, extractors.ByteCountIEC(dx))
 			msg = fmt.Sprintf("%s...(%s/%s) %s/s", cont,
 				extractors.ByteCountIEC(int64(total)), p, extractors.ByteCountIEC(dx))
 			m.Send(mtproto.MessagesEditMessage{
@@ -231,6 +238,11 @@ func (m *client) progUpdater(c chan int, msgID int32, userID int32, reqID, cont 
 }
 
 func (m *client) newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Warn("panic caught(m.newCallbackHandler):", err)
+		}
+	}()
 	if string(update.Data) == "null" {
 		m.Send(mtproto.MessagesSetBotCallbackAnswer{
 			Flags:   1 << 0,
@@ -257,16 +269,6 @@ func (m *client) newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 		})
 		return
 	}
-	if taskLimit <= 10 {
-		atomic.AddInt64(&taskLimit, 1)
-		defer atomic.AddInt64(&taskLimit, -1)
-	} else {
-		m.Send(mtproto.MessagesSetBotCallbackAnswer{
-			Flags:   1 << 0,
-			QueryID: update.QueryID,
-			Message: fmt.Sprintf("目前bot负载较大（%d），请稍后再试", taskLimit),
-		})
-	}
 	reqID := parse[0]
 	action := parse[1]
 	if val, ok := activeTask.Load(reqID); ok {
@@ -277,26 +279,11 @@ func (m *client) newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 			}
 			return
 		}
-		if ok := res.downLock.TryLock(); !ok {
-			m.Send(mtproto.MessagesSetBotCallbackAnswer{
-				Flags:   1 << 0,
-				QueryID: update.QueryID,
-				Message: "Err/当前已有正在运行的请求线程",
+		if action == "delete" {
+			m.Send(mtproto.MessagesDeleteMessages{
+				Flags: 1 << 0,
+				ID:    []int32{res.downMsgID},
 			})
-			return
-		}
-		defer res.downLock.Unlock()
-		if action == "download" {
-			m.queryHandler(res, update.UserID, reqID)
-			return
-		}
-		if action == "d2d3" {
-			band := parse[2]
-			m.downloadHandler(res, update.UserID, reqID, band)
-			return
-		}
-		if action == "select" {
-			m.selectHandler(res, update.UserID, update.QueryID, reqID)
 			return
 		}
 		if action == "page" {
@@ -307,6 +294,10 @@ func (m *client) newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 			m.pageHandler(res, update.UserID, page, reqID)
 			return
 		}
+		if action == "select" {
+			m.selectHandler(res, update.UserID, update.QueryID, reqID)
+			return
+		}
 		if action == "s4s5" {
 			sel, err := strconv.Atoi(parse[2])
 			if err != nil {
@@ -315,11 +306,52 @@ func (m *client) newCallbackHandler(update mtproto.UpdateBotCallbackQuery) {
 			m.pHandler(res, update.UserID, sel, reqID)
 			return
 		}
-		if action == "deletedown" {
-			m.Send(mtproto.MessagesDeleteMessages{
-				Flags: 1 << 0,
-				ID:    []int32{res.downMsgID},
+
+		// load
+		if u, ok := userLimit.Load(update.UserID); ok {
+			userQuery := u.(*int64)
+			if *userQuery > 6 {
+				m.Send(mtproto.MessagesSetBotCallbackAnswer{
+					Flags:   1 << 0,
+					QueryID: update.QueryID,
+					Message: fmt.Sprintf("请求太频繁啦！稍后再试"),
+				})
+				return
+			}
+			atomic.AddInt64(userQuery, 1)
+			defer atomic.AddInt64(userQuery, -1)
+		} else {
+			userQuery := int64(1)
+			userLimit.Store(update.UserID, &userQuery)
+		}
+		if taskLimit <= 15 {
+			atomic.AddInt64(&taskLimit, 1)
+			defer atomic.AddInt64(&taskLimit, -1)
+		} else {
+			m.Send(mtproto.MessagesSetBotCallbackAnswer{
+				Flags:   1 << 0,
+				QueryID: update.QueryID,
+				Message: fmt.Sprintf("目前bot并发请求数较大（%d），请稍后再试", taskLimit),
 			})
+		}
+		if ok := res.downLock.TryLock(); !ok {
+			m.Send(mtproto.MessagesSetBotCallbackAnswer{
+				Flags:   1 << 0,
+				QueryID: update.QueryID,
+				Message: "Err/当前已有正在运行的请求线程",
+			})
+			return
+		}
+		defer res.downLock.TryUnlock()
+
+		// unload
+		if action == "download" {
+			m.queryHandler(res, update.UserID, reqID)
+			return
+		}
+		if action == "d2d3" {
+			band := parse[2]
+			m.downloadHandler(res, update.UserID, reqID, band)
 			return
 		}
 	} else {
@@ -492,7 +524,7 @@ func (m *client) queryHandler(res *wrapper, userID int32, reqID string) {
 		Buttons: []mtproto.TL{
 			mtproto.KeyboardButtonCallback{
 				Text: "取消操作",
-				Data: []byte(fmt.Sprintf("%s,deletedown", reqID)),
+				Data: []byte(fmt.Sprintf("%s,delete", reqID)),
 			},
 		},
 	})
@@ -528,7 +560,7 @@ func (m *client) downloadHandler(res *wrapper, userID int32, reqID, band string)
 	tuns := make(chan int)
 	ctx, cancel := context.WithCancel(res.ctx)
 	res.dlCancel = cancel
-	go m.progUpdater(tuns, res.downMsgID, userID, reqID, res.GetTitle(res.currentP)+"\n\nDownloading", 0)
+	go m.progressUpdater(tuns, res.downMsgID, userID, reqID, res.GetTitle(res.currentP)+"\n\nDownloading", 0)
 	f, err := res.Download(ctx, band, tuns)
 	cancel()
 	if err != nil {
@@ -564,7 +596,6 @@ func (m *client) downloadHandler(res *wrapper, userID int32, reqID, band string)
 		wg.Add(1)
 		go m.uploadHandler(res, userID, info, band, f, wg)
 	}
-	wg.Add(1)
 	wgHandler(wg, f)
 }
 
@@ -580,18 +611,18 @@ func (m *client) uploadHandler(res *wrapper, userID int32, info os.FileInfo, ban
 		return
 	}
 	tuns := make(chan int)
-	go m.progUpdater(tuns, res.downMsgID, userID, "0", res.GetTitle(res.currentP)+"\n\nUploading", info.Size())
+	go m.progressUpdater(tuns, res.downMsgID, userID, "0", res.GetTitle(res.currentP)+"\n\nUploading", info.Size())
 	fl := m.uploadBigFile(file, info.Size(), tuns)
 	fl.Name = info.Name()
 	_ = file.Close()
 
-	var image *mtproto.InputFile
-	frame, err := getFrame(f)
+	var thumb *mtproto.InputFile
+	frame, err := getFrame(f, res.GetThumb(), res.GetDuring())
 	if err == nil {
 		// parse
 		src := m.uploadSmallFile(frame, int64(frame.Len()))
 		src.Name = strconv.Itoa(rand.Int())
-		image = &src
+		thumb = &src
 	} else {
 		log.Println(err)
 	}
@@ -608,7 +639,7 @@ func (m *client) uploadHandler(res *wrapper, userID int32, info os.FileInfo, ban
 		Flags: 1 << 0,
 		ID:    []int32{res.downMsgID},
 	})
-	fn := fmt.Sprintf("%s - %dx%d - %s", res.GetTitle(res.currentP), res.GetWidth(band), res.GetHeight(band), band)
+	fn := fmt.Sprintf("%s - %dx%d - %s", res.GetTitle(res.currentP), res.GetWidth(band), res.GetHeight(band), res.GetCodec(band))
 
 	media := mtproto.InputMediaUploadedDocument{
 		File:       fl,
@@ -616,9 +647,9 @@ func (m *client) uploadHandler(res *wrapper, userID int32, info os.FileInfo, ban
 		Attributes: []mtproto.TL{attr},
 	}
 
-	if image != nil {
+	if thumb != nil {
 		media.Flags = 1 << 2
-		media.Thumb = *image
+		media.Thumb = *thumb
 	}
 
 	resp := m.Send(mtproto.MessagesSendMedia{
@@ -632,6 +663,11 @@ func (m *client) uploadHandler(res *wrapper, userID int32, info os.FileInfo, ban
 }
 
 func (m *client) newMessageHandler(message mtproto.TL) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Warn("panic caught(m.newMessageHandler):", err)
+		}
+	}()
 	var msg mtproto.Message
 	if _, ok := message.(mtproto.Message); ok {
 		msg = message.(mtproto.Message)
@@ -724,7 +760,24 @@ func (m *client) newMessageHandler(message mtproto.TL) {
 			if msgID == 0 {
 				return
 			}
-			if taskLimit <= 10 {
+			if u, ok := userLimit.Load(msg.FromID); ok {
+				userQuery := u.(*int64)
+				if *userQuery > 6 {
+					m.Send(mtproto.MessagesEditMessage{
+						Flags:   1 << 11,
+						Peer:    mtproto.InputPeerUser{UserID: msg.FromID},
+						ID:      msgID,
+						Message: fmt.Sprintf("消息太频繁啦！稍后再试"),
+					})
+					return
+				}
+				atomic.AddInt64(userQuery, 1)
+				defer atomic.AddInt64(userQuery, -1)
+			} else {
+				userQuery := int64(1)
+				userLimit.Store(msg.FromID, &userQuery)
+			}
+			if taskLimit <= 30 {
 				atomic.AddInt64(&taskLimit, 1)
 				defer atomic.AddInt64(&taskLimit, -1)
 			} else {
@@ -732,8 +785,9 @@ func (m *client) newMessageHandler(message mtproto.TL) {
 					Flags:   1 << 11,
 					Peer:    mtproto.InputPeerUser{UserID: msg.FromID},
 					ID:      msgID,
-					Message: fmt.Sprintf("目前bot负载较大（%d），请稍后再试", taskLimit),
+					Message: fmt.Sprintf("目前bot并发请求数较大（%d），请稍后再试", taskLimit),
 				})
+				return
 			}
 			if ck, ok := userCookie.Load(msg.FromID); ok {
 				api.SetCookie(ck.(string))
@@ -801,7 +855,6 @@ func getMsgID(m mtproto.TL) int32 {
 	return 0
 }
 
-//func uploadBigFile(w chan int, file *os.File, info os.FileInfo) mtproto.InputFileBig {
 func (m *client) uploadBigFile(file io.Reader, size int64, p ...chan int) mtproto.InputFileBig {
 	pipe := false
 	if len(p) > 0 {
@@ -826,6 +879,8 @@ func (m *client) uploadBigFile(file io.Reader, size int64, p ...chan int) mtprot
 	}
 	total := int32(math.Ceil(float64(size) / float64(bsf)))
 	buf := make([]byte, bsf)
+	t2 := 0
+	tick := time.Now().Unix()
 	for {
 		n, err := file.Read(buf)
 		if err != nil {
@@ -843,8 +898,12 @@ func (m *client) uploadBigFile(file io.Reader, size int64, p ...chan int) mtprot
 		}, time.Second, 5, time.Minute)
 		log.Debug(res)
 		ps++
-		if pipe {
-			p[0] <- n
+		if pipe && time.Now().Unix()-tick > 1 {
+			p[0] <- t2
+			t2 = 0
+			tick = time.Now().Unix()
+		} else {
+			t2 += n
 		}
 	}
 
@@ -879,6 +938,7 @@ func (m *client) uploadSmallFile(file io.Reader, size int64, p ...chan int) mtpr
 	}
 	total := int32(math.Ceil(float64(size) / float64(bsf)))
 	buf := make([]byte, bsf)
+	//tick := time.Now().Unix()
 	for {
 		n, err := file.Read(buf)
 		if err != nil {
@@ -907,11 +967,34 @@ func (m *client) uploadSmallFile(file io.Reader, size int64, p ...chan int) mtpr
 	return res
 }
 
-func getFrame(filename string) (*bytes.Buffer, error) {
-	cmd := exec.Command("ffmpeg", "-i", filename, "-vframes", "1", "-f", "singlejpeg", "-")
+func getFrame(filename, thumb string, _ int32) (*bytes.Buffer, error) {
 	buf := new(bytes.Buffer)
-	cmd.Stdout = buf
+	log.Println(thumb)
+	ws, err := extractors.HttpGet(context.TODO(), thumb)
+	if err == nil {
+		bts, err := ioutil.ReadAll(ws)
+		_ = ws.Close()
+		buf.Reset()
+		buf.Write(bts)
+		conf, _, err := image.DecodeConfig(buf)
+		if err == nil && conf.Height >= 600 && conf.Width >= 800 {
+			buf.Reset()
+			buf.Write(bts)
+			img, _, _ := image.Decode(buf)
+			buf.Reset()
+			err = jpeg.Encode(buf, img, &jpeg.Options{Quality: 100})
+			if err == nil {
+				return buf, nil
+			}
+		}
+		log.Warn(err)
+	} else {
+		log.Warn(err)
+	}
 
+	cmd := exec.Command("ffmpeg", "-i", filename, "-vframes", "1", "-f", "singlejpeg", "-")
+	buf.Reset()
+	cmd.Stdout = buf
 	if cmd.Run() != nil {
 		return nil, fmt.Errorf("could not generate frame")
 	}

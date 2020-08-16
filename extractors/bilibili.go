@@ -155,11 +155,11 @@ func (l *Bili) Download(ctx context.Context, band string, tn chan int) (string, 
 		videoFile = path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".flv")
 	}
 
-	ck := baseHeader
+	ck := deepCopy(baseHeader).(map[string]string)
 	if l.cookie != "" {
-		ck["cookie"] = l.cookie
+		ck["Cookie"] = l.cookie
 	}
-	ck["referer"] = "https://www.bilibili.com/"
+	ck["Referer"] = "https://www.bilibili.com/"
 
 	log.Println(audioURL, videoURL, tn, ck)
 	err := dlHandler(ctx, videoFile, videoURL, ck, tn)
@@ -213,10 +213,11 @@ func (l *Bili) GetInfo(link string) (string, error) {
 		return "", fmt.Errorf("unknown link")
 	}
 
-	ck := baseHeader
+	ck := deepCopy(baseHeader).(map[string]string)
 	if l.cookie != "" {
-		ck["cookie"] = l.cookie
+		ck["Cookie"] = l.cookie
 	}
+	ck["Referer"] = "https://www.bilibili.com/"
 	//rsl, err := json.Marshal(ck)
 	//if err != nil {
 	//	return "", err
@@ -274,11 +275,11 @@ func (l *Bili) requestDownInfo(p int, band int) error {
 	link := fmt.Sprintf("https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%d&qn=%d&fourk=1&fnval=16",
 		l.VideoInfo.BvID, l.VideoInfo.Pages[p].Cid, band)
 
-	ck := baseHeader
+	ck := deepCopy(baseHeader).(map[string]string)
 	if l.cookie != "" {
-		ck["cookie"] = l.cookie
+		ck["Cookie"] = l.cookie
 	}
-	ck["referer"] = "https://www.bilibili.com/"
+	ck["Referer"] = "https://www.bilibili.com/"
 	//rsl, err := json.Marshal(ck)
 	//if err != nil {
 	//	return nil, nil, err
@@ -358,8 +359,23 @@ func (l *Bili) GetMeta() string {
 	return l.Meta
 }
 
+func (l *Bili) GetThumb() string {
+	return l.VideoInfo.Pic
+}
+
 func (l *Bili) GetCount() int {
 	return len(l.VideoInfo.Pages)
+}
+
+func (l *Bili) GetCodec(band string) string {
+	if len(l.DownInfo.Data.DashData.Video) != 0 {
+		for _, o := range l.DownInfo.Data.DashData.Video {
+			if strconv.Itoa(o.Bandwidth) == band {
+				return o.Codecs
+			}
+		}
+	}
+	return "flv"
 }
 
 func (l *Bili) GetSteam(dest string) (*DownloadInfo, error) {

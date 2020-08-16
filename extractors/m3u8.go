@@ -4,6 +4,7 @@ package extractors
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -274,7 +275,7 @@ func ParseFromURL(link string) (*DownloadInfo, error) {
 		return nil, err
 	}
 	link = u.String()
-	body, err := HttpGet(link)
+	body, err := HttpGet(context.TODO(), link)
 	if err != nil {
 		return nil, fmt.Errorf("request m3u8 URL failed: %s", err.Error())
 	}

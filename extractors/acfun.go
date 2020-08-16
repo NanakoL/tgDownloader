@@ -3,6 +3,7 @@ package extractors
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -108,6 +109,8 @@ func (l *AcFun) Download(ctx context.Context, band string, tn chan int) (string,
 		var content []byte
 		select {
 		case <-ctx.Done():
+			_ = file.Close()
+			_ = os.Remove(file.Name())
 			return "", fmt.Errorf("ctx cancelled")
 		default:
 			for {
@@ -120,6 +123,11 @@ func (l *AcFun) Download(ctx context.Context, band string, tn chan int) (string,
 					if err == nil {
 						break
 					}
+				}
+				if errors.Is(err, context.Canceled) {
+					_ = file.Close()
+					_ = os.Remove(file.Name())
+					return "", fmt.Errorf("ctx cancelled")
 				}
 				time.Sleep(time.Second)
 			}
@@ -142,9 +150,9 @@ func (l *AcFun) GetInfo(link string) (string, error) {
 	} else {
 		return "", fmt.Errorf("unknown link")
 	}
-	ck := baseHeader
+	ck := deepCopy(baseHeader).(map[string]string)
 	if l.cookie != "" {
-		ck["cookie"] = l.cookie
+		ck["Cookie"] = l.cookie
 	}
 	//rsl, err := json.Marshal(ck)
 
@@ -217,8 +225,21 @@ func (l *AcFun) GetDuring() int32 {
 	return int32(l.VideoInfo.CurrentVideoInfo.Dur / 1000)
 }
 
+func (l *AcFun) GetThumb() string {
+	return l.VideoInfo.Cover
+}
+
 func (l *AcFun) GetSubTitle(p int) string {
 	return l.VideoInfo.PlayList[p].Title
+}
+
+func (l *AcFun) GetCodec(band string) string {
+	for _, o := range l.DownInfo.Config.Config {
+		if strconv.Itoa(o.Bandwidth) == band {
+			return o.Codecs
+		}
+	}
+	return "unknown codec"
 }
 
 func (l *AcFun) GetTitle(p int) string {

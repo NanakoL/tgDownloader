@@ -18,6 +18,7 @@ import (
 
 type Youtube struct {
 	API
+	thumb     string
 	cookie    string
 	Duration  time.Duration
 	VideoInfo ytPlayerResponseData
@@ -196,9 +197,9 @@ func (v *Youtube) GetInfo(url string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("extractVideoID failed: %w", err)
 	}
-	ck := baseHeader
+	ck := deepCopy(baseHeader).(map[string]string)
 	if v.cookie != "" {
-		ck["cookie"] = v.cookie
+		ck["Cookie"] = v.cookie
 	}
 
 	// Circumvent age restriction to pretend access through googleapis.com
@@ -235,6 +236,7 @@ func (v *Youtube) GetMeta() string {
 			thumb = v.URL
 		}
 	}
+	v.thumb = thumb
 	return fmt.Sprintf("\n\nVideoID: %s\nChannelID: %s\n作者: %s\n时长: %s\n观看数: %s\n\nCover: %s",
 		details.VideoID, details.ChannelID, details.Author, v.Duration.String(),
 		details.ViewCount, thumb)
@@ -273,6 +275,21 @@ func (v *Youtube) handleURL(s, c string) string {
 		}
 		return link
 	}
+}
+
+func (v *Youtube) GetThumb() string {
+	return v.thumb
+}
+
+func (l *Youtube) GetCodec(band string) string {
+	for _, s := range l.Formats {
+		if strconv.Itoa(s.ItagNo) == band {
+			mt := s.MimeType[strings.Index(s.MimeType, "codecs=")+7:]
+			mt = mt[1 : len(mt)-1]
+			return mt
+		}
+	}
+	return "unknown codec"
 }
 
 func (v *Youtube) GetHeight(band string) int32 {
@@ -337,11 +354,11 @@ func (v *Youtube) Download(ctx context.Context, band string, s chan int) (string
 	audioFile := path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".m4a")
 	videoFile := path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".m4v")
 	video := path.Join(os.TempDir(), strconv.Itoa(rand.Int())+".mp4")
-	ck := baseHeader
+	ck := deepCopy(baseHeader).(map[string]string)
 	if v.cookie != "" {
-		ck["cookie"] = v.cookie
+		ck["Cookie"] = v.cookie
 	}
-	ck["referer"] = "https://www.youtube.com/"
+	ck["Referer"] = "https://www.youtube.com/"
 
 	log.Print(videoLink, audioLink, s, ck)
 	err := dlHandler(ctx, videoFile, videoLink, ck, s)
@@ -600,7 +617,7 @@ func parseDecipherOps(videoID string) (operations []operation, err error) {
 	}
 
 	embedURL := fmt.Sprintf("https://youtube.com/embed/%s?hl=en", videoID)
-	embedBody, err := getURL(embedURL)
+	embedBody, err := GetURL(embedURL)
 	if err != nil {
 		return nil, err
 	}
@@ -612,7 +629,7 @@ func parseDecipherOps(videoID string) (operations []operation, err error) {
 	// eg: ["js", "\/s\/player\/f676c671\/player_ias.vflset\/en_US\/base.js]
 	arr := strings.Split(escapedBasejsURL, ":\"")
 	basejsURL := "https://youtube.com" + strings.ReplaceAll(arr[len(arr)-1], "\\", "")
-	basejsBody, err := getURL(basejsURL)
+	basejsBody, err := GetURL(basejsURL)
 	if err != nil {
 		return nil, err
 	}
